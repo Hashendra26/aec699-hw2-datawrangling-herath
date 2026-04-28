@@ -1,0 +1,380 @@
+---
+title: "Data Wrangling"
+author:
+  - name: "Hashendra"
+    affiliation: "Oregon State University"
+date: "2026-04-24"
+output:
+  html_document:
+    theme: flatly
+    highlight: haddock
+    toc: true
+    toc_depth: 3
+    toc_float: true
+    keep_md: true
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE,
+  cache = TRUE,
+  message = FALSE,
+  warning = FALSE
+)
+```
+
+## Preliminaries
+
+### Load libraries
+
+```{r libs, cache=FALSE, message=FALSE, warning=FALSE}
+if (!requireNamespace("pacman", quietly = TRUE)) {
+  install.packages("pacman")
+}
+
+pacman::p_load(
+  httr,        # download files from web
+  readxl,      # read Excel files
+  here,        # relative file paths
+  tidyverse,   # dplyr, ggplot2, tidyr, etc.
+  janitor,     # clean_names()
+  scales,      # comma labels
+  ggthemes,    # extra ggplot themes
+  plotly,      # interactive plots
+  countrycode, # country codes
+  lubridate,   # dates
+  tsibble      # yearquarter() and scale_x_yearquarter()
+)
+```
+
+### Read in the data
+
+```{r get, output=FALSE}
+url <- "https://www.eia.gov/coal/archive/coal_historical_exports.xlsx"
+
+if (!dir.exists(here::here("data"))) {
+  dir.create(here::here("data"), recursive = TRUE)
+}
+
+GET(url, write_disk(here::here("data/coal_historical_exports.xlsx"), overwrite = TRUE))
+```
+
+```{r read}
+coal <- read_xlsx(here::here("data/coal_historical_exports.xlsx"), skip = 3, na = ".")
+```
+
+---
+
+## 1) Clean the column names
+
+The raw column names from EIA come with a mix of spaces, capitalization, and
+special characters. I standardise them with `janitor::clean_names()`, which
+converts everything to lowercase `snake_case` and replaces spaces / special
+characters with underscores.
+
+```{r clean-names}
+coal <- coal |> clean_names()
+
+# Inspect
+names(coal)
+head(coal)
+```
+
+
+---
+
+## 2) Total US coal exports over time (year only)
+
+I aggregate all export tonnage to the annual level and plot a simple time
+series.
+
+```{r yearly-total}
+# The year column should be identified after cleaning; inspect if needed
+# Typical clean column names: year, quarter, coal_type, customs_district,
+#                             destination_country, total (short tons)
+
+coal_year <- coal |>
+  group_by(year) |>
+  summarise(total_exports = sum(total, na.rm = TRUE), .groups = "drop")
+
+ggplot(coal_year, aes(x = year, y = total_exports)) +
+  geom_line(color = "#2c7bb6", linewidth = 1) +
+  geom_point(color = "#2c7bb6", size = 2) +
+  scale_y_continuous(labels = scales::comma) +
+  labs(
+    title    = "Total US Coal Exports by Year",
+    subtitle = "Source: EIA Coal Historical Exports",
+    x        = "Year",
+    y        = "Short Tons"
+  ) +
+  theme_minimal(base_size = 13)
+```
+
+**Secular trends observed:** US coal exports were relatively flat through the
+early 2000s, then increase sharply from around 2008–2012. After the 2012 peak, exports declined substantially. A brief partial recovery in certain years is visible but the long-run trend from the peak is clearly downward, consistent with the global energy transition narrative.
+
+---
+
+## 3) Total US coal exports over time (year AND quarter)
+
+```{r quarterly-total}
+coal_quarter <- coal |>
+  group_by(year, quarter) |>
+  summarise(total_exports = sum(total, na.rm = TRUE), .groups = "drop") |>
+  # Convert to actual date: use first month of each quarter
+  mutate(
+    date = yq(paste0(year, " Q", quarter))
+  )
+
+ggplot(coal_quarter, aes(x = date, y = total_exports)) +
+  geom_line(color = "#d7191c", linewidth = 0.8) +
+  scale_x_date(date_breaks = "2 years", date_labels = "%Y") +
+  scale_y_continuous(labels = scales::comma) +
+  labs(
+    title    = "Total US Coal Exports by Quarter",
+    subtitle = "Quarterly aggregation reveals intra-year seasonality",
+    x        = NULL,
+    y        = "Short Tons"
+  ) +
+  theme_minimal(base_size = 13)
+```
+
+**Seasonality:** The quarterly plot does reveal within-year variation that is
+smoothed away by annual aggregation. Coal exports tend to be higher in Q1 and Q4
+(winter heating demand in global markets) and softer in Q2–Q3. This how the coal
+exports fluctuate with the seasons.
+
+---
+
+## 4) Exports by destination country
+
+### 4.1) Create `coal_country`
+
+```{r coal-country}
+coal_country <- coal |>
+  group_by(coal_destination_country, year, quarter) |>
+  summarise(total_exports = sum(total, na.rm = TRUE), .groups = "drop")
+
+print(coal_country)
+```
+
+### 4.2) Inspect the data frame
+
+```{r inspect-missing}
+# How many unique year-quarter combos exist in the full data?
+all_periods <- coal_country |>
+  distinct(year, quarter) |>
+  nrow()
+
+# How many does Albania actually appear in?
+albania_periods <- coal_country |>
+  filter(coal_destination_country == "Albania") |>
+  nrow()
+
+cat("Total year-quarter periods in dataset:", all_periods, "\n")
+cat("Periods with Albania data:", albania_periods, "\n")
+```
+**Reason:**Albania appears in fewer observations than the total number of year–quarter periods. This reflects an implicit missing data issue: the missing values are not recorded as NA; instead, the corresponding rows are absent from the dataset. This typically occurs because the U.S. did not export to certain countries, such as Albania, in some periods, so no record was generated for those country–time combinations. 
+
+### 4.3) Complete the data frame
+
+I use `tidyr::complete()` to create all possible country × year × quarter
+combinations, filling the implicitly missing export values with `0`.
+
+```{r complete-panel}
+coal_country <- coal_country |>
+  complete(
+    coal_destination_country,
+    year    = full_seq(year, 1),
+    quarter = 1:4,
+    fill    = list(total_exports = 0)
+  ) |>
+  arrange(coal_destination_country, year, quarter)
+
+print(coal_country)
+```
+
+### 4.4) Some more tidying up
+
+```{r filter-empty-quarter}
+# Identify any year-quarter where ALL countries have zero exports
+# (i.e., the quarter was created artificially by complete() beyond the data range)
+all_zero_quarters <- coal_country |>
+  group_by(year, quarter) |>
+  summarise(grand_total = sum(total_exports), .groups = "drop") |>
+  filter(grand_total == 0)
+
+print(all_zero_quarters)
+
+# Filter them out
+coal_country <- coal_country |>
+  anti_join(all_zero_quarters, by = c("year", "quarter"))
+```
+
+**Why this happens:** `When using complete() with full_seq(year, 1) and quarter = 1:4, the data is expanded to include all possible year–quarter combinations. If the dataset were downloaded mid-year, this process could create future quarters (e.g., Q3 or Q4 of the current year) that have no actual data yet, leading to rows where exports are zero for all countries. However, since no such zero-total quarters are observed here, the dataset appears to include only fully reported periods.
+
+### 4.5) Cumulative top 10 export destinations
+
+```{r top10-cumulative}
+coal10_culm <- coal_country |>
+  group_by(coal_destination_country) |>
+  summarise(total = sum(total_exports), .groups = "drop") |>
+  slice_max(total, n = 10) |>
+  pull(coal_destination_country)
+
+coal10_culm
+```
+
+**Top 10 cumulative destinations** are historically the large industrial
+economies with heavy coal use: countries like Canada, Netherlands, South Korea,
+Japan, Brazil, India, United Kingdom, Germany, Italy, and China tend to
+dominate, though the exact order depends on the vintage of data.
+
+### 4.6) Recent top 10 export destinations
+
+```{r top10-recent}
+# Most recent quarter in dataset
+max_year    <- max(coal_country$year)
+max_quarter <- coal_country |> filter(year == max_year) |> pull(quarter) |> max()
+
+coal10_recent <- coal_country |>
+  filter(year == max_year, quarter == max_quarter) |>
+  slice_max(total_exports, n = 10) |>
+  pull(coal_destination_country)
+
+coal10_recent
+```
+
+The recent top 10 likely shows a larger share of Asian markets
+(India, South Korea, Japan) relative to European ones, reflecting the shift in
+global coal trade patterns over the 2010s–2020s. European countries have
+reduced coal consumption via energy transition policies, while Asian demand
+remained elevated or grew. Beyond secular trends, spot factors like LNG price
+spikes, unusual weather, and industrial restocking can make a single quarter's
+top-10 look quite different from the long-run average.
+
+### 4.7) Quarterly exports by country (top 10 + Other)
+
+```{r plot-by-country}
+coal_plot <- coal_country |>
+  mutate(
+    date    = yq(paste0(year, " Q", quarter)),
+    country = if_else(coal_destination_country %in% coal10_culm,
+                      coal_destination_country, "Other")
+  ) |>
+  group_by(date, country) |>
+  summarise(total_exports = sum(total_exports), .groups = "drop")
+
+ggplot(coal_plot, aes(x = date, y = total_exports, color = country)) +
+  geom_line(alpha = 0.8) +
+  scale_y_continuous(labels = scales::comma) +
+  labs(
+    title = "US Coal Exports by Destination Country (Quarterly)",
+    x     = NULL, y = "Short Tons", color = "Destination"
+  ) +
+  theme_minimal()
+```
+
+I plot quarterly exports for the top 10 cumulative destinations, grouping all remaining countries into "Other". This gives a cleaner picture of which major buyers drove US coal trade over time
+
+### 4.8) Make it pretty
+
+```{r plot-pretty}
+# Shorten country names to ISO3 for cleaner legend
+iso_lookup <- function(x) {
+  countrycode(x, origin = "country.name", destination = "iso3c",
+              warn = FALSE)
+}
+
+coal_plot_pretty <- coal_plot |>
+  mutate(
+    country_iso = if_else(country == "Other", "Other",
+                          iso_lookup(country)),
+    # Order factor so "Other" is last, remaining sorted by cumulative volume
+    country_iso = fct_reorder(country_iso, total_exports,
+                              .fun = sum, .desc = TRUE),
+    country_iso = fct_relevel(country_iso, "Other", after = Inf)
+  )
+
+p <- ggplot(coal_plot_pretty,
+            aes(x = date, y = total_exports / 1e6,
+                color = country_iso, group = country_iso)) +
+  geom_line(aes(linewidth = (country_iso != "Other")), alpha = 0.85) +
+  scale_linewidth_manual(values = c("TRUE" = 0.9, "FALSE" = 0.45),
+                         guide = "none") +
+  scale_color_manual(
+    values = c(
+      RColorBrewer::brewer.pal(10, "Paired"), "grey80"
+    )
+  ) +
+  scale_x_date(date_breaks = "3 years", date_labels = "%Y") +
+  scale_y_continuous(labels = scales::comma) +
+  labs(
+    title    = "U.S. Coal Exports by Destination",
+    subtitle = "Top 10 cumulative destinations highlighted; remaining countries pooled as 'Other'",
+    caption  = "Source: EIA Coal Historical Exports",
+    x        = NULL,
+    y        = "Million Short Tons",
+    color    = NULL
+  ) +
+  theme_economist(base_size = 11) +
+  theme(
+    legend.position  = "right",
+    legend.key.width = unit(1.5, "lines"),
+    plot.title       = element_text(face = "bold")
+  )
+
+p
+```
+
+I tidy up the plot by converting country names to ISO3 codes for a cleaner legend, ordering countries by total export volume, and pushing "Other" to the bottom. The result is a more readable, but little busy as most of the countires are overlapping.
+
+
+### 4.9) Make it interactive
+
+```{r interactive chart, cache=FALSE}
+ggplotly(p, tooltip = c("x", "y", "colour")) |>
+  layout(
+    legend = list(orientation = "v", x = 1.02, y = 0.5),
+    hovermode = "closest"
+  )
+```
+
+
+I wrap the plot in ggplotly() to make it interactive. The tooltip argument controls what information appears on hover, showing the year, export value, and country name. Setting hovermode = "closest" snaps the tooltip to the nearest individual line, so hovering over a country's line shows only that country's data rather than all countries at that date simultaneously
+
+---
+
+## 5) Show something interesting: Coal type breakdown and the thermal vs. metallurgical shift
+
+
+
+```{r more details}
+coal_type <- coal |>
+  select(year, steam_coal, metallurgical, coke) |>
+  pivot_longer(
+    cols = c(steam_coal, metallurgical, coke),
+    names_to  = "coal_type",
+    values_to = "exports"
+  ) |>
+  group_by(year, coal_type) |>
+  summarise(total_exports = sum(exports, na.rm = TRUE), .groups = "drop")
+
+ggplot(coal_type, aes(x = year, y = total_exports / 1e6, color = coal_type)) +
+  geom_line(linewidth = 1) +
+  geom_point(size = 2) +
+  scale_color_brewer(palette = "Set2") +
+  scale_y_continuous(labels = scales::comma) +
+  labs(
+    title    = "US Coal Exports by Coal Type",
+    subtitle = "Thermal vs. metallurgical (met) coal have different demand drivers",
+    x        = "Year",
+    y        = "Million Short Tons",
+    color    = "Coal Type",
+    caption  = "Source: EIA"
+  ) +
+  theme_minimal(base_size = 13) +
+  theme(legend.position = "bottom")
+```
+I examine how the composition of U.S. coal exports has evolved over time. Metallurgical and steam coal account for the vast majority of exports, while coke remains negligible throughout the period. Both major coal types exhibit similar cyclical patterns rising sharply into the early 2010s, declining afterward, and partially recovering in recent years. This indicates that overall trends in total U.S. coal exports are largely driven by demand for metallurgical and steam coal.
+
